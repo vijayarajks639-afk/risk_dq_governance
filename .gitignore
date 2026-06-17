@@ -1,0 +1,22 @@
+# Generated data (synthetic, but keep the repo clean and reproducible)
+data/*.csv
+data/*.json
+
+# Personal interview-prep notes — keep LOCAL ONLY, never push (names a specific role)
+BCBS239_LEARNING.md
+
+# Secrets — never commit the API key
+.streamlit/secrets.toml
+.env
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
