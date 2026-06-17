@@ -1,5 +1,7 @@
 # Risk Data Quality Governance Copilot
 
+This demo is created by AI Agent. 
+
 A working demo of a **BCBS 239 risk-data-quality governance and reporting** workflow,
 with an AI agent that triages data-quality (DQ) exceptions and drafts remediation
 narratives for a Data Quality Governance Council (DQGC).
