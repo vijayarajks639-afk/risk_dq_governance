@@ -152,18 +152,31 @@ def triage() -> pd.DataFrame:
         except Exception as exc:  # SDK missing or init failed -> graceful fallback
             print(f"  (Anthropic SDK unavailable: {exc} — using templated fallback.)")
 
-    narratives = []
+    narratives, sources = [], []
     for i, issue in issues.iterrows():
+        text, src = None, None
         if client is not None and i < config.AI_MAX_ISSUES:
             try:
-                narratives.append(claude_narrative(client, issue))
-                continue
+                text = claude_narrative(client, issue)
+                src = f"claude:{config.AI_MODEL}"
             except Exception as exc:
                 print(f"  (Claude call failed for {issue['issue_id']}: {exc} "
                       f"— falling back to template.)")
-        narratives.append(templated_narrative(issue))
+        if text is None:
+            text = templated_narrative(issue)
+            src = "templated:rules-v1"
+        narratives.append(text)
+        sources.append(src)
 
+    # Stamp AI-governance metadata on every narrative. This is what makes the AI
+    # Governance tab show *real* provenance (which model, when, review status) rather
+    # than a mock-up — and it's the audit trail Principle 12 (Review) expects.
+    from datetime import datetime as _dt
     issues["remediation_narrative"] = narratives
+    issues["narrative_source"] = sources
+    issues["generated_ts"] = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    issues["review_status"] = "Pending DQGC review"   # nothing is auto-approved
+    issues["human_reviewed"] = "No"
     issues.to_csv(config.ISSUES_CSV, index=False)
     return issues, mode
 

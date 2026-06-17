@@ -23,6 +23,7 @@ import streamlit as st
 
 import config
 import dq_rules
+import ai_governance
 
 st.set_page_config(page_title="Risk DQ Governance", page_icon="🛡️", layout="wide")
 
@@ -86,8 +87,9 @@ c5.metric("High priority", high_issues if not issues.empty else "—")
 st.caption(f"Reporting (as-of) date: **{config.REPORTING_DATE}** · "
            f"Domains: {', '.join(config.RISK_DOMAINS)}")
 
-tab_score, tab_findings, tab_issues, tab_adapt = st.tabs(
-    ["📊 Scorecard", "🔎 Findings", "🗂️ DQGC Issues", "🧭 Adaptability (P6)"])
+tab_score, tab_findings, tab_issues, tab_adapt, tab_ai = st.tabs(
+    ["📊 Scorecard", "🔎 Findings", "🗂️ DQGC Issues", "🧭 Adaptability (P6)",
+     "🤖 AI Governance"])
 
 # ── Tab 1: Scorecard (evidence of compliance — P9, P12) ──────────────────────
 with tab_score:
@@ -144,6 +146,15 @@ with tab_issues:
             with st.expander(
                     f"{badge} {r['issue_id']} · {r['principle']} · "
                     f"{r['record_count']} record(s) · {r['priority']} priority"):
+                # AI-governance provenance banner — never present an AI draft as final.
+                src = str(r.get("narrative_source", ""))
+                if src.startswith("claude"):
+                    prov = f"🤖 **AI-DRAFTED** ({src.split(':', 1)[-1]})"
+                else:
+                    prov = "📋 Rules-based draft"
+                st.warning(f"{prov} · {r.get('generated_ts', '')} — status: "
+                           f"**{r.get('review_status', 'Pending DQGC review')}** · "
+                           f"human-reviewed: {r.get('human_reviewed', 'No')}")
                 st.markdown(f"**Failed control:** `{r['rule']}` on CDE `{r['field']}`  ")
                 st.markdown(f"**Domain(s):** {r['domains']}  ")
                 st.markdown(f"**Example IDs:** {r['sample_ids']}")
@@ -168,6 +179,56 @@ with tab_adapt:
         st.dataframe(agg, width="stretch", hide_index=True, height=360)
     else:
         st.info("Select at least one dimension.")
+
+# ── Tab 5: AI Governance — "AI is a model" (MRM + EU AI Act + BCBS 239) ───────
+with tab_ai:
+    st.subheader("AI Governance — risks, controls, and the principle map")
+    st.caption("**\"AI is a model.\"** Every place a model touches the risk-data flow is "
+               "a touchpoint that must be owned, validated, explainable and human-"
+               "supervised. This is the AI risk register for the demo, plus the "
+               "reference map of AI risk across all 14 BCBS 239 principles.")
+
+    counts = ai_governance.control_counts()
+    posture = ai_governance.overall_posture()
+    ai_drafted = pending = 0
+    if not issues.empty and "narrative_source" in issues.columns:
+        ai_drafted = int(issues["narrative_source"].astype(str)
+                         .str.startswith("claude").sum())
+    if not issues.empty and "review_status" in issues.columns:
+        pending = int((issues["review_status"] == "Pending DQGC review").sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("AI touchpoints", len(ai_governance.AI_TOUCHPOINTS))
+    k2.metric("Controls in place",
+              f"{counts.get('Green', 0)}/{len(ai_governance.AI_CONTROLS)}")
+    k3.metric("Open gaps (Red)", counts.get("Red", 0))
+    k4.metric("Overall posture", posture)
+
+    st.markdown("**AI touchpoint register** — you can't govern what you can't see")
+    st.dataframe(pd.DataFrame(ai_governance.AI_TOUCHPOINTS),
+                 width="stretch", hide_index=True)
+
+    st.markdown("**Control self-assessment** — an honest RAG of this touchpoint")
+    ctrl = pd.DataFrame(ai_governance.AI_CONTROLS)
+    st.dataframe(ctrl.style.map(rag_style, subset=["Status"]),
+                 width="stretch", hide_index=True)
+
+    if not issues.empty and "review_status" in issues.columns:
+        st.info(f"🤖 **{ai_drafted} of {len(issues)}** issue narratives are AI-drafted · "
+                f"**{pending}** pending DQGC review · **0** auto-approved. "
+                "AI drafts; the council decides.")
+
+    with st.expander("📘 Reference: AI risk mapped across all 14 BCBS 239 principles"):
+        st.caption("The framework a Divisional Data Office applies firm-wide — each "
+                   "principle's AI failure mode, the control to embed, and the regime "
+                   "(EU AI Act / US MRM / BIS) it helps satisfy.")
+        st.dataframe(pd.DataFrame(ai_governance.AI_PRINCIPLE_MAP),
+                     width="stretch", hide_index=True)
+
+    st.caption("Regulatory anchors: **EU AI Act** (high-risk obligations from 2 Aug "
+               "2026; credit scoring = high-risk) · **US interagency Model Risk "
+               "Management** (2026, retiring SR 11-7 — \"AI is a model\") · **BIS/ECB** "
+               "on explainability and governance.")
 
 st.divider()
 st.caption("Risk DQ Governance Copilot · synthetic data · a portfolio + learning "
