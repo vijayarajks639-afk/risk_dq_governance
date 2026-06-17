@@ -44,9 +44,3 @@ The AI triage step (`ai_triage.py`) is optional and degrades gracefully to a
 templated narrative when no `ANTHROPIC_API_KEY` is configured, so the demo runs
 end-to-end with zero spend.
 
-## Honesty notes for the interview
-
-- Synthetic data only — say so up front; it shows judgment and respect for IP.
-- The AI **drafts**; the DQGC **decides**. Governance stays human. Lead with that.
-- This is a thinking tool, not a production control framework — it shows *how you'd
-  approach* modernising a Divisional Data Office.
