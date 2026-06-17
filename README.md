@@ -14,7 +14,7 @@ narratives for a Data Quality Governance Council (DQGC).
 
 ## Why this exists
 
-It maps directly to the mandate of a **Firm Risk Management (FRM) Divisional Data
+It maps directly to the mandate of a **Divisional Data
 Office**: develop and monitor data-quality standards across risk domains (credit,
 market, liquidity), evidence compliance with the **BCBS 239 principles**, run the
 **DQGC** cadence, and renovate **risk reporting** onto a strategic platform.
