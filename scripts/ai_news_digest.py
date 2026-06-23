@@ -26,6 +26,7 @@ import re
 import json
 import ssl
 import time
+import socket
 import html as html_lib
 import smtplib
 import urllib.parse
@@ -42,6 +43,10 @@ IST = pytz.timezone("Asia/Kolkata")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _SSL = ssl.create_default_context()
+
+# Global socket timeout — prevents feedparser from hanging indefinitely on slow
+# or unresponsive feeds (no native timeout param in feedparser).
+socket.setdefaulttimeout(18)
 
 # Domains treated as authoritative — items from these float to the top of the
 # risk/governance sections even if slightly older than a fresh news item.
@@ -145,9 +150,11 @@ def split_gnews_title(title: str):
 
 
 def parse_feed(url: str, agent: str = UA):
-    """feedparser with a browser UA + bounded retry."""
+    """feedparser with a browser UA + bounded retry (2 attempts, short sleep).
+    socket.setdefaulttimeout(18) above caps each attempt so a hanging feed
+    can't burn more than ~36s total before we give up."""
     last = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             d = feedparser.parse(url, agent=agent)
             if d.entries:
@@ -155,7 +162,7 @@ def parse_feed(url: str, agent: str = UA):
             last = d
         except Exception as exc:
             print(f"      retry {attempt+1}: {type(exc).__name__}")
-        time.sleep(1.0 * (attempt + 1))
+        time.sleep(0.5 * (attempt + 1))
     return last if last is not None else feedparser.parse(url, agent=agent)
 
 
@@ -201,12 +208,13 @@ def fetch_rss(sources, max_per_feed=10):
 def fetch_hackernews(query='AI OR LLM OR "machine learning" OR "AI governance"',
                      min_points=30, limit=12):
     cutoff = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp())
-    url = ("https://hn.algolia.com/api/v1/search?"
-           + urllib.parse.urlencode({
-               "query": query, "tags": "story",
-               "numericFilters": f"points>{min_points},created_at_i>{cutoff}",
-               "hitsPerPage": limit,
-           }))
+    # Build URL manually — urlencode double-encodes '>' and ',' in numericFilters,
+    # which causes a 400 Bad Request from the Algolia API.
+    q = urllib.parse.quote(query)
+    url = (f"https://hn.algolia.com/api/v1/search?"
+           f"query={q}&tags=story"
+           f"&numericFilters=points>{min_points},created_at_i>{cutoff}"
+           f"&hitsPerPage={limit}")
     out = []
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -334,15 +342,13 @@ DIRECT_AI_FEEDS = [
     {"name": "Wired", "url": "https://www.wired.com/feed/category/artificial-intelligence/latest/rss"},
 ]
 
-# Direct regulator/authority feeds.
-# IMPORTANT: these publish ALL press releases with no AI filter.  Always pass
-# their output through ai_filter() before ranking — otherwise obituaries, FOMC
-# statements and routine enforcement actions flood the top slots (authority
-# score +220 makes them win regardless of topic).
+# Direct regulator/authority feeds — only include feeds that reliably respond.
+# IMPORTANT: these publish ALL press releases; always pass through ai_filter()
+# before ranking to drop obituaries, FOMC statements, enforcement actions etc.
+# OCC (occ_news.xml) and Bank of England consistently time out on the runner —
+# their content is covered by targeted Google News queries in build_sections().
 REGULATOR_FEEDS = [
     {"name": "US Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
-    {"name": "OCC", "url": "https://www.occ.gov/rss/occ_news.xml"},
-    {"name": "Bank of England", "url": "https://www.bankofengland.co.uk/boeapps/rss/feeds.aspx?feed=News"},
 ]
 
 
