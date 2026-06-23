@@ -12,6 +12,7 @@ Builds a multi-section HTML email tuned for AI risk / governance interview prep:
   6. Indian IT & AI                    (TCS, Infosys, Wipro, HCLTech, Tech Mahindra)
   7. US Banks & AI                     (JPMorgan, BofA, Wells Fargo, Citi, Morgan Stanley)
   8. Social Buzz                       (Reddit + Hacker News)
+  9. YouTube Video Picks               (AI governance & risk videos — requires YOUTUBE_API_KEY)
 
 Engine: Google News RSS search (supports site:/when:) + direct publisher &
         regulator RSS + Hacker News Algolia API.
@@ -233,6 +234,55 @@ def fetch_hackernews(query='AI OR LLM OR "machine learning" OR "AI governance"',
             })
     except Exception as exc:
         print(f"    [WARN] Hacker News: {type(exc).__name__}: {str(exc)[:70]}")
+    return out
+
+
+def fetch_youtube(api_key: str, query: str, days: int = 2, max_results: int = 10):
+    """Search YouTube Data API v3 for recent interview-relevant videos.
+    Each call costs 100 quota units; free tier = 10,000 units/day.
+    Returns [] silently if api_key is missing or quota is exceeded."""
+    if not api_key:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = urllib.parse.urlencode({
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "order": "date",
+        "publishedAfter": cutoff,
+        "maxResults": max_results,
+        "relevanceLanguage": "en",
+        "key": api_key,
+    })
+    out = []
+    try:
+        req = urllib.request.Request(
+            f"https://www.googleapis.com/youtube/v3/search?{params}",
+            headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        for item in data.get("items", []):
+            snippet = item.get("snippet", {})
+            vid_id = item.get("id", {}).get("videoId")
+            if not vid_id:
+                continue
+            pub = None
+            pub_str = snippet.get("publishedAt", "")
+            if pub_str:
+                try:
+                    pub = datetime.strptime(pub_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            desc = strip_html(snippet.get("description", ""))[:180]
+            out.append({
+                "title": strip_html(snippet.get("title", "Untitled")),
+                "link": f"https://www.youtube.com/watch?v={vid_id}",
+                "summary": (desc + "…") if desc else "",
+                "published": pub,
+                "source": "▶ " + snippet.get("channelTitle", "YouTube"),
+            })
+    except Exception as exc:
+        print(f"    [WARN] YouTube API: {type(exc).__name__}: {str(exc)[:70]}")
     return out
 
 
@@ -462,7 +512,7 @@ def build_sections():
         "subtitle": "TCS · Infosys · Wipro · HCLTech · Tech Mahindra",
     }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=10)))
 
-    # 8 ── Social Buzz ── (always last)
+    # 8 ── Social Buzz ──
     reddit = [
         {"name": "Reddit r/artificial",
          "url": "https://www.reddit.com/r/artificial/top/.rss?t=day"},
@@ -475,6 +525,23 @@ def build_sections():
         "title": "Top 5 · Social Buzz",
         "subtitle": "Most-discussed on Reddit & Hacker News (X/LinkedIn need paid APIs)",
     }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=3)))
+
+    # 9 ── YouTube Video Picks ── (requires YOUTUBE_API_KEY secret)
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if yt_key:
+        yt_arts = fetch_youtube(
+            yt_key,
+            query=('AI risk governance banking "model risk" OR "EU AI Act" '
+                   'OR "BCBS 239" OR "responsible AI" OR "AI governance" '
+                   'OR "NIST AI RMF" OR "AI regulation"'),
+            days=3, max_results=10)
+        sections.append(({
+            "emoji": "📺", "accent": "#CC0000",
+            "title": "Top 5 · YouTube Video Picks",
+            "subtitle": "AI governance, risk management & regulation — recent video content",
+        }, rank_and_dedupe(yt_arts, 5, seen, seen_fps, recency_days=7)))
+    else:
+        print("    [INFO] YOUTUBE_API_KEY not set — skipping YouTube section.")
 
     return sections
 
@@ -643,8 +710,8 @@ def build_html(sections, now_ist, brief=None):
         <strong style="color:#a0aec0;">10:00 PM IST</strong> daily.<br>
         Sources: TechCrunch · VentureBeat · Verge · MIT Tech Review · Wired · HBR · MIT Sloan ·
         BIS/BCBS · EU · NIST · OECD · ESMA/EBA · FSB · RBI · Fed · OCC · BoE · MAS · FCA · PRA ·
-        Reddit · Hacker News (via Google News RSS, AI-filtered). Ranked by recency + source
-        authority + interview relevance.
+        YouTube (Data API v3) · Reddit · Hacker News (via Google News RSS, AI-filtered).
+        Ranked by recency + source authority + interview relevance.
       </p>
     </td></tr>
   </table>
@@ -675,6 +742,22 @@ def main():
     now_ist = datetime.now(IST)
     period = "Morning" if now_ist.hour < 12 else "Evening"
     print(f"[{now_ist:%Y-%m-%d %H:%M:%S IST}] Building AI & Risk Digest ({period})…")
+
+    # ── Schedule throttle ─────────────────────────────────────────────────
+    # DIGEST_MODE controls which cron slots actually send email.
+    # Set via GitHub Secret or workflow env var — no code change needed to switch.
+    #   "both"    (default) — send at every cron trigger (6 AM + 10 PM IST)
+    #   "morning" — send only on the 6 AM trigger; skip 10 PM silently
+    #   "evening" — send only on the 10 PM trigger; skip 6 AM silently
+    mode = os.environ.get("DIGEST_MODE", "both").lower()
+    if mode == "morning" and now_ist.hour >= 12:
+        print(f"  DIGEST_MODE=morning — skipping evening run (hour={now_ist.hour}). "
+              "Change to DIGEST_MODE=both to restore twice-daily.")
+        return
+    if mode == "evening" and now_ist.hour < 12:
+        print(f"  DIGEST_MODE=evening — skipping morning run (hour={now_ist.hour}). "
+              "Change to DIGEST_MODE=both to restore twice-daily.")
+        return
 
     sections = build_sections()
     total = sum(len(a) for _, a in sections)

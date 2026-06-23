@@ -31,4 +31,7 @@ jobs:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL:           ${{ secrets.TO_EMAIL }}
+          # YouTube Data API v3 key — same secret as daily digest. Adds a "YouTube Video Picks"
+          # section to the weekly recap (5 videos from the past 7 days).
+          YOUTUBE_API_KEY:    ${{ secrets.YOUTUBE_API_KEY }}
         run: python scripts/ai_weekly_recap.py

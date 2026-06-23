@@ -265,6 +265,48 @@ def fetch_rss(urls_with_meta, max_per=10):
     return out
 
 
+def fetch_youtube(api_key: str, query: str, days: int = 7, max_results: int = 10):
+    """YouTube Data API v3 search — 100 quota units per call, 10k/day free."""
+    if not api_key:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = urllib.parse.urlencode({
+        "part": "snippet", "q": query, "type": "video",
+        "order": "date", "publishedAfter": cutoff,
+        "maxResults": max_results, "relevanceLanguage": "en", "key": api_key,
+    })
+    out = []
+    try:
+        req = urllib.request.Request(
+            f"https://www.googleapis.com/youtube/v3/search?{params}",
+            headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        for item in data.get("items", []):
+            snippet = item.get("snippet", {})
+            vid_id = item.get("id", {}).get("videoId")
+            if not vid_id:
+                continue
+            pub = None
+            pub_str = snippet.get("publishedAt", "")
+            if pub_str:
+                try:
+                    pub = datetime.strptime(pub_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            desc = strip_html(snippet.get("description", ""))[:180]
+            out.append({
+                "title": strip_html(snippet.get("title", "Untitled")),
+                "link": f"https://www.youtube.com/watch?v={vid_id}",
+                "summary": (desc + "…") if desc else "",
+                "published": pub,
+                "source": "▶ " + snippet.get("channelTitle", "YouTube"),
+            })
+    except Exception as exc:
+        print(f"  [WARN] YouTube API: {type(exc).__name__}: {str(exc)[:70]}")
+    return out
+
+
 def top_stories(articles, n, seen):
     now = datetime.now(timezone.utc)
     BOOST_KEYS = ("bcbs 239","sr 11-7","model risk","nist ai","eu ai act","ai act",
@@ -315,6 +357,20 @@ def build_reg_pulse():
          'OR site:fca.org.uk OR site:rbi.org.in OR site:mas.gov.sg) '
          '("AI" OR "artificial intelligence" OR "model risk" OR "BCBS 239") when:14d')
     arts = fetch_rss([g(q), g('("EU AI Act" OR "NIST AI RMF" OR "SR 11-7" OR "FREE-AI" OR "MAS AI" OR "FCA AI") when:14d')])
+    return top_stories(arts, 5, seen)
+
+
+def build_youtube_picks(yt_key: str):
+    """Top 5 YouTube videos from the past 7 days relevant to AI risk & governance."""
+    if not yt_key:
+        return []
+    seen = set()
+    arts = fetch_youtube(
+        yt_key,
+        query=('AI risk governance finance "model risk" OR "EU AI Act" '
+               'OR "BCBS 239" OR "responsible AI" OR "AI regulation" '
+               'OR "NIST AI RMF" OR "AI governance banking"'),
+        days=7, max_results=12)
     return top_stories(arts, 5, seen)
 
 
@@ -428,7 +484,7 @@ def _must_reads_block(reads):
     </table>"""
 
 
-def build_html(now_ist, top10, reg5, dive, qas, reads):
+def build_html(now_ist, top10, reg5, yt5, dive, qas, reads):
     week_str = now_ist.strftime("Week of %d %B %Y")
     top10_cards = "".join(_story_card(i+1, a, "#6C63FF") for i, a in enumerate(top10))
     reg5_cards  = "".join(_story_card(i+1, a, "#E94560") for i, a in enumerate(reg5))
@@ -440,7 +496,15 @@ def build_html(now_ist, top10, reg5, dive, qas, reads):
                                   "What moved in AI regulation & governance this week",
                                   "#E94560", reg5_cards)
 
-    body = top10_section + reg_section + _framework_block(dive) + _qas_block(qas) + _must_reads_block(reads)
+    yt_section = ""
+    if yt5:
+        yt5_cards = "".join(_story_card(i+1, a, "#CC0000") for i, a in enumerate(yt5))
+        yt_section = _section_wrap("📺", "YouTube Video Picks",
+                                   "AI governance, risk & regulation — videos from this week",
+                                   "#CC0000", yt5_cards)
+
+    body = (top10_section + reg_section + yt_section
+            + _framework_block(dive) + _qas_block(qas) + _must_reads_block(reads))
 
     return f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -487,12 +551,17 @@ def main():
     reg5 = build_reg_pulse()
     print(f"  Got {len(reg5)} regulatory items.")
 
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    print("  Fetching YouTube video picks…")
+    yt5 = build_youtube_picks(yt_key)
+    print(f"  Got {len(yt5)} YouTube picks." if yt_key else "  YOUTUBE_API_KEY not set — skipping YouTube picks.")
+
     dive  = FRAMEWORK_DEEP_DIVES[week_idx % len(FRAMEWORK_DEEP_DIVES)]
     qas   = INTERVIEW_QAS[week_idx % len(INTERVIEW_QAS)]
     reads = MUST_READS[week_idx % len(MUST_READS)]
     print(f"  Framework: {dive['name']}")
 
-    html = build_html(now_ist, top10, reg5, dive, qas, reads)
+    html = build_html(now_ist, top10, reg5, yt5, dive, qas, reads)
     subject = f"[AI & Risk Weekly] {now_ist.strftime('Week of %d %b %Y')}"
 
     if os.environ.get("PREVIEW_ONLY") == "1":
