@@ -26,11 +26,13 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install feedparser pytz
+        run: pip install feedparser pytz anthropic
 
       - name: Run AI News Digest
         env:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL:           ${{ secrets.TO_EMAIL }}
+          # Optional: set this secret to add an AI-written "Editor's Brief".
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/ai_news_digest.py
