@@ -1,0 +1,20 @@
+[
+  {
+    "type": "once",
+    "date": "2026-07-15",
+    "title": "Interview at HSBC",
+    "message": "Review BCBS 239 (14 principles) + RBI FREE-AI (7 Sutras). Refresh Three Lines of Defence and SR 11-7 successor talking points."
+  },
+  {
+    "type": "weekly",
+    "weekday": "thursday",
+    "title": "Weekly interview prep nudge",
+    "message": "Re-read this week's Framework Deep Dive from Sunday's recap. Pick one interview Q&A and write out your answer from memory."
+  },
+  {
+    "type": "monthly",
+    "day": 1,
+    "title": "Monthly knowledge audit",
+    "message": "Go back through your last 4 weekly recaps. Any framework card you can't explain cold — add it to active review."
+  }
+]

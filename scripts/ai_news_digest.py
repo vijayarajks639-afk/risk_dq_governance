@@ -12,6 +12,7 @@ Builds a multi-section HTML email tuned for AI risk / governance interview prep:
   6. Indian IT & AI                    (TCS, Infosys, Wipro, HCLTech, Tech Mahindra)
   7. US Banks & AI                     (JPMorgan, BofA, Wells Fargo, Citi, Morgan Stanley)
   8. Social Buzz                       (Reddit + Hacker News)
+  9. YouTube Video Picks               (AI governance & risk videos — requires YOUTUBE_API_KEY)
 
 Engine: Google News RSS search (supports site:/when:) + direct publisher &
         regulator RSS + Hacker News Algolia API.
@@ -26,6 +27,7 @@ import re
 import json
 import ssl
 import time
+import socket
 import html as html_lib
 import smtplib
 import urllib.parse
@@ -42,6 +44,10 @@ IST = pytz.timezone("Asia/Kolkata")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 _SSL = ssl.create_default_context()
+
+# Global socket timeout — prevents feedparser from hanging indefinitely on slow
+# or unresponsive feeds (no native timeout param in feedparser).
+socket.setdefaulttimeout(18)
 
 # Domains treated as authoritative — items from these float to the top of the
 # risk/governance sections even if slightly older than a fresh news item.
@@ -145,9 +151,11 @@ def split_gnews_title(title: str):
 
 
 def parse_feed(url: str, agent: str = UA):
-    """feedparser with a browser UA + bounded retry."""
+    """feedparser with a browser UA + bounded retry (2 attempts, short sleep).
+    socket.setdefaulttimeout(18) above caps each attempt so a hanging feed
+    can't burn more than ~36s total before we give up."""
     last = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             d = feedparser.parse(url, agent=agent)
             if d.entries:
@@ -155,7 +163,7 @@ def parse_feed(url: str, agent: str = UA):
             last = d
         except Exception as exc:
             print(f"      retry {attempt+1}: {type(exc).__name__}")
-        time.sleep(1.0 * (attempt + 1))
+        time.sleep(0.5 * (attempt + 1))
     return last if last is not None else feedparser.parse(url, agent=agent)
 
 
@@ -201,12 +209,13 @@ def fetch_rss(sources, max_per_feed=10):
 def fetch_hackernews(query='AI OR LLM OR "machine learning" OR "AI governance"',
                      min_points=30, limit=12):
     cutoff = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp())
-    url = ("https://hn.algolia.com/api/v1/search?"
-           + urllib.parse.urlencode({
-               "query": query, "tags": "story",
-               "numericFilters": f"points>{min_points},created_at_i>{cutoff}",
-               "hitsPerPage": limit,
-           }))
+    # Build URL manually — urlencode double-encodes '>' and ',' in numericFilters,
+    # which causes a 400 Bad Request from the Algolia API.
+    q = urllib.parse.quote(query)
+    url = (f"https://hn.algolia.com/api/v1/search?"
+           f"query={q}&tags=story"
+           f"&numericFilters=points>{min_points},created_at_i>{cutoff}"
+           f"&hitsPerPage={limit}")
     out = []
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -225,6 +234,55 @@ def fetch_hackernews(query='AI OR LLM OR "machine learning" OR "AI governance"',
             })
     except Exception as exc:
         print(f"    [WARN] Hacker News: {type(exc).__name__}: {str(exc)[:70]}")
+    return out
+
+
+def fetch_youtube(api_key: str, query: str, days: int = 2, max_results: int = 10):
+    """Search YouTube Data API v3 for recent interview-relevant videos.
+    Each call costs 100 quota units; free tier = 10,000 units/day.
+    Returns [] silently if api_key is missing or quota is exceeded."""
+    if not api_key:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = urllib.parse.urlencode({
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "order": "date",
+        "publishedAfter": cutoff,
+        "maxResults": max_results,
+        "relevanceLanguage": "en",
+        "key": api_key,
+    })
+    out = []
+    try:
+        req = urllib.request.Request(
+            f"https://www.googleapis.com/youtube/v3/search?{params}",
+            headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        for item in data.get("items", []):
+            snippet = item.get("snippet", {})
+            vid_id = item.get("id", {}).get("videoId")
+            if not vid_id:
+                continue
+            pub = None
+            pub_str = snippet.get("publishedAt", "")
+            if pub_str:
+                try:
+                    pub = datetime.strptime(pub_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            desc = strip_html(snippet.get("description", ""))[:180]
+            out.append({
+                "title": strip_html(snippet.get("title", "Untitled")),
+                "link": f"https://www.youtube.com/watch?v={vid_id}",
+                "summary": (desc + "…") if desc else "",
+                "published": pub,
+                "source": "▶ " + snippet.get("channelTitle", "YouTube"),
+            })
+    except Exception as exc:
+        print(f"    [WARN] YouTube API: {type(exc).__name__}: {str(exc)[:70]}")
     return out
 
 
@@ -334,15 +392,13 @@ DIRECT_AI_FEEDS = [
     {"name": "Wired", "url": "https://www.wired.com/feed/category/artificial-intelligence/latest/rss"},
 ]
 
-# Direct regulator/authority feeds.
-# IMPORTANT: these publish ALL press releases with no AI filter.  Always pass
-# their output through ai_filter() before ranking — otherwise obituaries, FOMC
-# statements and routine enforcement actions flood the top slots (authority
-# score +220 makes them win regardless of topic).
+# Direct regulator/authority feeds — only include feeds that reliably respond.
+# IMPORTANT: these publish ALL press releases; always pass through ai_filter()
+# before ranking to drop obituaries, FOMC statements, enforcement actions etc.
+# OCC (occ_news.xml) and Bank of England consistently time out on the runner —
+# their content is covered by targeted Google News queries in build_sections().
 REGULATOR_FEEDS = [
     {"name": "US Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
-    {"name": "OCC", "url": "https://www.occ.gov/rss/occ_news.xml"},
-    {"name": "Bank of England", "url": "https://www.bankofengland.co.uk/boeapps/rss/feeds.aspx?feed=News"},
 ]
 
 
@@ -456,7 +512,7 @@ def build_sections():
         "subtitle": "TCS · Infosys · Wipro · HCLTech · Tech Mahindra",
     }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=10)))
 
-    # 8 ── Social Buzz ── (always last)
+    # 8 ── Social Buzz ──
     reddit = [
         {"name": "Reddit r/artificial",
          "url": "https://www.reddit.com/r/artificial/top/.rss?t=day"},
@@ -469,6 +525,23 @@ def build_sections():
         "title": "Top 5 · Social Buzz",
         "subtitle": "Most-discussed on Reddit & Hacker News (X/LinkedIn need paid APIs)",
     }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=3)))
+
+    # 9 ── YouTube Video Picks ── (requires YOUTUBE_API_KEY secret)
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if yt_key:
+        yt_arts = fetch_youtube(
+            yt_key,
+            query=('AI risk governance banking "model risk" OR "EU AI Act" '
+                   'OR "BCBS 239" OR "responsible AI" OR "AI governance" '
+                   'OR "NIST AI RMF" OR "AI regulation"'),
+            days=3, max_results=10)
+        sections.append(({
+            "emoji": "📺", "accent": "#CC0000",
+            "title": "Top 5 · YouTube Video Picks",
+            "subtitle": "AI governance, risk management & regulation — recent video content",
+        }, rank_and_dedupe(yt_arts, 5, seen, seen_fps, recency_days=7)))
+    else:
+        print("    [INFO] YOUTUBE_API_KEY not set — skipping YouTube section.")
 
     return sections
 
@@ -637,8 +710,8 @@ def build_html(sections, now_ist, brief=None):
         <strong style="color:#a0aec0;">10:00 PM IST</strong> daily.<br>
         Sources: TechCrunch · VentureBeat · Verge · MIT Tech Review · Wired · HBR · MIT Sloan ·
         BIS/BCBS · EU · NIST · OECD · ESMA/EBA · FSB · RBI · Fed · OCC · BoE · MAS · FCA · PRA ·
-        Reddit · Hacker News (via Google News RSS, AI-filtered). Ranked by recency + source
-        authority + interview relevance.
+        YouTube (Data API v3) · Reddit · Hacker News (via Google News RSS, AI-filtered).
+        Ranked by recency + source authority + interview relevance.
       </p>
     </td></tr>
   </table>
@@ -669,6 +742,22 @@ def main():
     now_ist = datetime.now(IST)
     period = "Morning" if now_ist.hour < 12 else "Evening"
     print(f"[{now_ist:%Y-%m-%d %H:%M:%S IST}] Building AI & Risk Digest ({period})…")
+
+    # ── Schedule throttle ─────────────────────────────────────────────────
+    # DIGEST_MODE controls which cron slots actually send email.
+    # Set via GitHub Secret or workflow env var — no code change needed to switch.
+    #   "both"    (default) — send at every cron trigger (6 AM + 10 PM IST)
+    #   "morning" — send only on the 6 AM trigger; skip 10 PM silently
+    #   "evening" — send only on the 10 PM trigger; skip 6 AM silently
+    mode = os.environ.get("DIGEST_MODE", "both").lower()
+    if mode == "morning" and now_ist.hour >= 12:
+        print(f"  DIGEST_MODE=morning — skipping evening run (hour={now_ist.hour}). "
+              "Change to DIGEST_MODE=both to restore twice-daily.")
+        return
+    if mode == "evening" and now_ist.hour < 12:
+        print(f"  DIGEST_MODE=evening — skipping morning run (hour={now_ist.hour}). "
+              "Change to DIGEST_MODE=both to restore twice-daily.")
+        return
 
     sections = build_sections()
     total = sum(len(a) for _, a in sections)

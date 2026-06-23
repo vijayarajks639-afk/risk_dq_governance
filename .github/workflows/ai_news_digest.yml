@@ -9,6 +9,14 @@ on:
     - cron: "30 16 * * *"  # 10:00 PM IST
   workflow_dispatch:        # Manual "Run now" trigger from GitHub Actions UI
 
+# ── SCHEDULE CONTROL ──────────────────────────────────────────────────────────
+# To switch to once-daily without editing cron lines, set the DIGEST_MODE secret:
+#   DIGEST_MODE = "both"    → send at 6 AM and 10 PM IST (default, twice-daily)
+#   DIGEST_MODE = "morning" → send only at 6 AM IST (10 PM run exits silently)
+#   DIGEST_MODE = "evening" → send only at 10 PM IST (6 AM run exits silently)
+# To pause entirely, comment out both cron lines above (workflow_dispatch still works).
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
   send-digest:
     name: Fetch AI news & send email
@@ -33,6 +41,12 @@ jobs:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TO_EMAIL:           ${{ secrets.TO_EMAIL }}
-          # Optional: set this secret to add an AI-written "Editor's Brief".
+          # Set DIGEST_MODE secret to "morning" or "evening" to go once-daily.
+          # Leave unset (or set to "both") for the default twice-daily schedule.
+          DIGEST_MODE:        ${{ secrets.DIGEST_MODE }}
+          # YouTube Data API v3 key — add as secret YOUTUBE_API_KEY to enable Section 9.
+          # Free tier: 10,000 quota units/day (each search = 100 units; ~98 searches/day headroom).
+          YOUTUBE_API_KEY:    ${{ secrets.YOUTUBE_API_KEY }}
+          # Optional: set ANTHROPIC_API_KEY secret to add an AI-written "Editor's Brief".
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/ai_news_digest.py

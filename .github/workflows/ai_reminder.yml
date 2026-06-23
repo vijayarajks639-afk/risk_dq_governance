@@ -1,0 +1,34 @@
+name: AI Interview Prep Reminder
+
+# IST = UTC + 5:30
+# 9:00 AM IST → 03:30 UTC  (morning nudge, after the 6 AM digest settles)
+on:
+  schedule:
+    - cron: "30 3 * * *"   # 9:00 AM IST daily
+  workflow_dispatch:        # "Run now" from GitHub Actions UI for on-demand nudges
+
+jobs:
+  send-reminder:
+    name: Check & send due reminders
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pytz
+
+      - name: Run reminder check
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TO_EMAIL:           ${{ secrets.TO_EMAIL }}
+        run: python scripts/ai_reminder.py
