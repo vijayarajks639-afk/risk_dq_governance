@@ -237,14 +237,57 @@ def _score(a, now, authority):
     else:
         s += 12.0
     title_l = a["title"].lower()
-    if any(k in title_l for k in INTERVIEW_KEYWORDS):
+    summary_l = a.get("summary", "").lower()
+    has_interview_kw = any(k in title_l or k in summary_l for k in INTERVIEW_KEYWORDS)
+    if has_interview_kw:
         s += 70.0                              # interview-relevant keyword boost
     if authority and any(d in domain_of(a["link"]) for d in AUTHORITY_DOMAINS):
-        s += 220.0                             # authoritative regulator/source
+        # Full authority boost only when the article is also interview-relevant;
+        # otherwise a small lift to avoid burying legitimate regulator content but
+        # preventing obituaries/enforcement-actions from flooding the top slots.
+        s += 220.0 if has_interview_kw else 40.0
     return s
 
 
-def rank_and_dedupe(articles, n, seen_keys, recency_days=None, authority=False):
+def _title_fingerprint(title: str) -> str:
+    """6-significant-word fingerprint for cross-outlet same-story dedup."""
+    STOP = {"the", "a", "an", "is", "are", "was", "were", "to", "of",
+            "in", "on", "for", "and", "or", "its", "it", "with", "that",
+            "by", "at", "as", "be", "has", "have", "had", "this", "from"}
+    tokens = re.sub(r"[^a-z0-9\s]", "", title.lower()).split()
+    sig = [t for t in tokens if t not in STOP][:6]
+    return " ".join(sig)
+
+
+# Keywords used to filter raw regulator RSS feeds (which carry all press releases)
+# down to only AI-relevant items.
+FS_AI_KEYWORDS = {
+    "ai", "artificial intelligence", "machine learning", "model risk",
+    "sr 11-7", "free-ai", "llm", "generative", "algorithm", "agentic",
+    "data governance", "bcbs 239", "explainability", "responsible ai",
+    "large language", "neural", "automated decision", "algorithmic",
+    "fintech", "regtech", "supervisory model", "validation",
+}
+
+
+def ai_filter(articles):
+    """Drop articles whose title+summary contain no AI/governance keyword.
+
+    Applied to raw regulator RSS output to prevent obituaries, routine
+    enforcement actions, and monetary-policy statements from flooding
+    AI-focused sections.
+    """
+    out = []
+    for a in articles:
+        text = (a["title"] + " " + a.get("summary", "")).lower()
+        if any(kw in text for kw in FS_AI_KEYWORDS):
+            out.append(a)
+    return out
+
+
+def rank_and_dedupe(articles, n, seen_keys, seen_fps=None, recency_days=None, authority=False):
+    if seen_fps is None:
+        seen_fps = set()
     now = datetime.now(timezone.utc)
     for a in articles:
         a["stale"] = bool(recency_days and a["published"]
@@ -256,10 +299,14 @@ def rank_and_dedupe(articles, n, seen_keys, recency_days=None, authority=False):
 
     result = []
     for a in ranked:
+        # Primary dedup: 45-char normalised title key (catches exact/near-exact titles)
         key = re.sub(r"[^a-z0-9]", "", a["title"].lower())[:45]
-        if not key or key in seen_keys:
+        # Secondary dedup: 6-significant-word fingerprint (catches same story, different headline)
+        fp = _title_fingerprint(a["title"])
+        if not key or key in seen_keys or fp in seen_fps:
             continue
         seen_keys.add(key)
+        seen_fps.add(fp)
         result.append(a)
         if len(result) >= n:
             break
@@ -287,7 +334,11 @@ DIRECT_AI_FEEDS = [
     {"name": "Wired", "url": "https://www.wired.com/feed/category/artificial-intelligence/latest/rss"},
 ]
 
-# Direct regulator/authority feeds — a reliability floor under the risk sections.
+# Direct regulator/authority feeds.
+# IMPORTANT: these publish ALL press releases with no AI filter.  Always pass
+# their output through ai_filter() before ranking — otherwise obituaries, FOMC
+# statements and routine enforcement actions flood the top slots (authority
+# score +220 makes them win regardless of topic).
 REGULATOR_FEEDS = [
     {"name": "US Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml"},
     {"name": "OCC", "url": "https://www.occ.gov/rss/occ_news.xml"},
@@ -300,17 +351,48 @@ def g(query, region="US"):
 
 
 def build_sections():
-    seen = set()
+    seen = set()      # normalised 45-char title keys (cross-section exact dedup)
+    seen_fps = set()  # 6-word fingerprints (cross-section same-story dedup)
     sections = []
 
-    # 1 ── AI Around the World ──
-    arts = fetch_rss(DIRECT_AI_FEEDS +
-                     [g("artificial intelligence (model OR launch OR breakthrough OR funding) when:3d")])
+    # ── Section order (interview-priority first) ──────────────────────────
+    # 1. Financial-Services AI Regulation  ← most specific to FS interviews
+    # 2. AI Risk, Governance & Regulation  ← global frameworks (EU AI Act etc.)
+    # 3. US Banks & AI                     ← target employer awareness
+    # 4. Big Tech & AI
+    # 5. AI Around the World
+    # 6. Consulting & AI
+    # 7. Indian IT & AI
+    # 8. Social Buzz                       ← least structured, always last
+
+    # 1 ── Financial-Services AI Regulation ──
+    # Google News AI-filtered queries replace raw REGULATOR_FEEDS to avoid
+    # non-AI press releases (obituaries, FOMC, enforcement actions) flooding
+    # the section via the authority score boost.
+    fs_query = ('("model risk" OR "SR 11-7" OR "FREE-AI" OR "AI governance" OR "AI in banking" '
+                'OR "AI risk") (RBI OR "Reserve Bank of India" OR SEBI OR MAS OR FCA OR PRA '
+                'OR "Federal Reserve" OR OCC OR "model risk management") when:30d')
+    fed_ai_query = ('("Federal Reserve" OR OCC OR FDIC OR "Office of the Comptroller") '
+                    '("artificial intelligence" OR "AI" OR "model risk" OR "machine learning" '
+                    'OR "SR 11-7" OR "large language model" OR "generative AI") when:90d')
+    fca_query = ('(FCA OR PRA OR "Bank of England" OR "Prudential Regulation Authority") '
+                 '("artificial intelligence" OR "AI regulation" OR "model risk" OR "AI governance") '
+                 'when:60d')
+    mas_query = ('(MAS OR "Monetary Authority of Singapore" OR "HKMA" OR "APRA") '
+                 '("artificial intelligence" OR "AI governance" OR "model risk") when:60d')
+    # Also pull direct regulator RSS but pass through ai_filter() to drop non-AI items.
+    reg_raw = ai_filter(fetch_rss(REGULATOR_FEEDS))
+    arts = (reg_raw
+            + fetch_rss([g(fs_query), g(fs_query, region="IN"),
+                         g('"FREE-AI" OR "RBI" "artificial intelligence" finance when:45d', region="IN"),
+                         g(fed_ai_query),
+                         g(fca_query, region="GB"),
+                         g(mas_query)]))
     sections.append(({
-        "emoji": "🌐", "accent": "#6C63FF",
-        "title": "Top 5 · AI Around the World",
-        "subtitle": "Global breakthroughs, launches, research & funding",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=4)))
+        "emoji": "🏛️", "accent": "#C0392B",
+        "title": "Top 5 · Financial-Services AI Regulation",
+        "subtitle": "Fed/OCC model risk (SR 11-7) · RBI FREE-AI · SEBI · MAS · FCA · PRA",
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=45, authority=True)))
 
     # 2 ── AI Risk, Governance & Regulation (global frameworks) ──
     risk_auth = ('(site:bis.org OR site:europa.eu OR site:nist.gov OR site:oecd.org '
@@ -326,20 +408,17 @@ def build_sections():
         "emoji": "⚖️", "accent": "#E94560",
         "title": "Top 5 · AI Risk, Governance & Regulation",
         "subtitle": "EU AI Act · NIST AI RMF · ISO 42001 · BIS/BCBS 239 · OECD · FSB",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=30, authority=True)))
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=30, authority=True)))
 
-    # 3 ── Financial-Services AI Regulation (NEW — fills the FS/India gap) ──
-    fs_query = ('("model risk" OR "SR 11-7" OR "FREE-AI" OR "AI governance" OR "AI in banking" '
-                'OR "AI risk") (RBI OR "Reserve Bank of India" OR SEBI OR MAS OR FCA OR PRA '
-                'OR "Federal Reserve" OR OCC OR "model risk management") when:30d')
-    arts = (fetch_rss(REGULATOR_FEEDS)
-            + fetch_rss([g(fs_query), g(fs_query, region="IN"),
-                         g('"FREE-AI" OR "RBI" "artificial intelligence" finance when:45d', region="IN")]))
+    # 3 ── US Banks & AI ── (moved up: target-employer awareness)
+    arts = fetch_rss([g('(JPMorgan OR "JP Morgan" OR "Bank of America" OR "Wells Fargo" '
+                        'OR Citigroup OR Citi OR "Morgan Stanley") '
+                        '("AI" OR "artificial intelligence") when:7d')])
     sections.append(({
-        "emoji": "🏛️", "accent": "#C0392B",
-        "title": "Top 5 · Financial-Services AI Regulation",
-        "subtitle": "Fed/OCC model risk (SR 11-7) · RBI FREE-AI · SEBI · MAS · FCA · PRA",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=45, authority=True)))
+        "emoji": "🏦", "accent": "#9B51E0",
+        "title": "Top 5 · US Banks & AI",
+        "subtitle": "JPMorgan · Bank of America · Wells Fargo · Citi · Morgan Stanley",
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=10)))
 
     # 4 ── Big Tech & AI ──
     arts = fetch_rss([g('(Google OR Alphabet OR Microsoft OR Meta OR Amazon OR Apple) '
@@ -348,37 +427,36 @@ def build_sections():
         "emoji": "💻", "accent": "#2D9CDB",
         "title": "Top 5 · Big Tech & AI",
         "subtitle": "Google · Microsoft · Meta · Amazon · Apple",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=7)))
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=7)))
 
-    # 5 ── Consulting & AI ──
+    # 5 ── AI Around the World ──
+    arts = fetch_rss(DIRECT_AI_FEEDS +
+                     [g("artificial intelligence (model OR launch OR breakthrough OR funding) when:3d")])
+    sections.append(({
+        "emoji": "🌐", "accent": "#6C63FF",
+        "title": "Top 5 · AI Around the World",
+        "subtitle": "Global breakthroughs, launches, research & funding",
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=4)))
+
+    # 6 ── Consulting & AI ──
     arts = fetch_rss([g('(McKinsey OR "Boston Consulting Group" OR BCG OR Bain OR Deloitte OR Accenture) '
                         '("AI report" OR "generative AI" OR "AI risk" OR "AI governance" OR "AI adoption") when:10d')])
     sections.append(({
         "emoji": "📊", "accent": "#27AE60",
         "title": "Top 5 · Consulting & AI",
         "subtitle": "McKinsey · BCG · Bain · Deloitte · Accenture",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=14)))
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=14)))
 
-    # 6 ── Indian IT & AI ──
+    # 7 ── Indian IT & AI ──
     arts = fetch_rss([g('(TCS OR "Tata Consultancy" OR Infosys OR Wipro OR HCLTech OR "HCL Technologies" '
                         'OR "Tech Mahindra") ("AI" OR "generative AI") when:7d', region="IN")])
     sections.append(({
         "emoji": "🇮🇳", "accent": "#F2994A",
         "title": "Top 5 · Indian IT & AI",
         "subtitle": "TCS · Infosys · Wipro · HCLTech · Tech Mahindra",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=10)))
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=10)))
 
-    # 7 ── US Banks & AI ──
-    arts = fetch_rss([g('(JPMorgan OR "JP Morgan" OR "Bank of America" OR "Wells Fargo" '
-                        'OR Citigroup OR Citi OR "Morgan Stanley") '
-                        '("AI" OR "artificial intelligence") when:7d')])
-    sections.append(({
-        "emoji": "🏦", "accent": "#9B51E0",
-        "title": "Top 5 · US Banks & AI",
-        "subtitle": "JPMorgan · Bank of America · Wells Fargo · Citi · Morgan Stanley",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=10)))
-
-    # 8 ── Social Buzz ──
+    # 8 ── Social Buzz ── (always last)
     reddit = [
         {"name": "Reddit r/artificial",
          "url": "https://www.reddit.com/r/artificial/top/.rss?t=day"},
@@ -390,7 +468,7 @@ def build_sections():
         "emoji": "💬", "accent": "#EB5757",
         "title": "Top 5 · Social Buzz",
         "subtitle": "Most-discussed on Reddit & Hacker News (X/LinkedIn need paid APIs)",
-    }, rank_and_dedupe(arts, 5, seen, recency_days=3)))
+    }, rank_and_dedupe(arts, 5, seen, seen_fps, recency_days=3)))
 
     return sections
 
@@ -453,7 +531,7 @@ def _card(idx, art, accent):
              style="background:#fff;border-radius:8px;border-left:4px solid {accent};
                     box-shadow:0 1px 4px rgba(0,0,0,.07);">
         <tr><td style="padding:14px 20px 4px 20px;">
-          <span style="font-size:11px;font-weight:700;color:{accent};
+          <span style="font-size:12px;font-weight:700;color:{accent};
                        text-transform:uppercase;letter-spacing:.5px;">
             #{idx} &nbsp;·&nbsp; {source}</span>
         </td></tr>
@@ -533,13 +611,18 @@ def build_html(sections, now_ist, brief=None):
     body = brief_block + _framework_card(now_ist) + "".join(_section_html(m, a) for m, a in sections)
 
     return f"""<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+</head>
 <body style="margin:0;padding:0;background:#f4f6fb;font-family:'Segoe UI',Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f6fb">
 <tr><td align="center" style="padding:32px 16px;">
-  <table width="660" cellpadding="0" cellspacing="0" border="0" style="max-width:660px;width:100%;">
+  <!-- width attribute intentionally omitted; max-width:660px via style only,
+       so Gmail Android / Outlook Mobile reflow correctly at 375-414px. -->
+  <table cellpadding="0" cellspacing="0" border="0" style="max-width:660px;width:100%;">
     <tr><td style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 60%,#0f3460 100%);
-               border-radius:12px 12px 0 0;padding:32px 36px;">
+               border-radius:12px 12px 0 0;padding:24px 20px;">
       <p style="margin:0 0 4px 0;font-size:12px;color:#6C63FF;font-weight:700;
                 letter-spacing:1px;text-transform:uppercase;">{period} Digest &nbsp;·&nbsp; {time_str}</p>
       <h1 style="margin:0 0 8px 0;font-size:27px;font-weight:800;color:#fff;line-height:1.2;">
@@ -553,8 +636,9 @@ def build_html(sections, now_ist, brief=None):
         GitHub workflow · delivered <strong style="color:#a0aec0;">6:00 AM</strong> &amp;
         <strong style="color:#a0aec0;">10:00 PM IST</strong> daily.<br>
         Sources: TechCrunch · VentureBeat · Verge · MIT Tech Review · Wired · HBR · MIT Sloan ·
-        Fed · OCC · BoE · BIS/BCBS · EU · NIST · OECD · ESMA/EBA · FSB · RBI · Reddit · Hacker News
-        (aggregated via Google News RSS). Ranked by recency + source authority + interview relevance.
+        BIS/BCBS · EU · NIST · OECD · ESMA/EBA · FSB · RBI · Fed · OCC · BoE · MAS · FCA · PRA ·
+        Reddit · Hacker News (via Google News RSS, AI-filtered). Ranked by recency + source
+        authority + interview relevance.
       </p>
     </td></tr>
   </table>
