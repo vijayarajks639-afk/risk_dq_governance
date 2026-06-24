@@ -1,25 +1,18 @@
 name: AI News Digest
 
 # IST = UTC + 5:30
-# 6:00 AM IST  → 00:30 UTC  (Mon–Sat only)
-# 9:00 AM IST  → 03:30 UTC  (Sunday only — leisurely morning read before weekly recap)
-# 10:00 PM IST → 16:30 UTC  (every day)
+# 6:00 AM IST → 00:30 UTC  (every day)
 on:
   schedule:
-    - cron: "30 0 * * 1-6"  # 6:00 AM IST  Mon–Sat
-    - cron: "30 3 * * 0"    # 9:00 AM IST  Sunday only
-    - cron: "30 16 * * *"   # 10:00 PM IST daily
-  workflow_dispatch:         # Manual "Run now" trigger from GitHub Actions UI
+    - cron: "30 0 * * *"   # 6:00 AM IST daily
+  workflow_dispatch:        # Manual "Run now" trigger from GitHub Actions UI
 
 # ── SCHEDULE CONTROL ──────────────────────────────────────────────────────────
-# Sunday runs at 9 AM IST (not 6 AM) so you get a relaxed morning read.
-# The weekly recap still goes out at 8 PM IST Sunday evening — no conflict.
+# Single daily run at 6:00 AM IST.  The Sunday Weekly Recap goes at 8 PM IST
+# from a separate workflow (ai_weekly_recap.yml) — no conflict.
 #
-# To throttle to once-daily without touching cron lines, set the DIGEST_MODE secret:
-#   DIGEST_MODE = "both"    → send morning + 10 PM IST (default)
-#   DIGEST_MODE = "morning" → send only the morning edition (10 PM run exits silently)
-#   DIGEST_MODE = "evening" → send only 10 PM IST (morning run exits silently)
-# To pause entirely, comment out the three cron lines above (workflow_dispatch still works).
+# To pause entirely: comment out the cron line above (workflow_dispatch still works).
+# To skip a single run: set DIGEST_MODE secret to "off" and the script exits silently.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
