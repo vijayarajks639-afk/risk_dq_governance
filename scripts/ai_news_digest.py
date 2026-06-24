@@ -18,6 +18,8 @@ Builds a multi-section HTML email tuned for AI risk / governance interview prep:
 Engine: Google News RSS search (supports site:/when:) + direct publisher &
         regulator RSS + Hacker News Algolia API.
 Ranking: recency + authority (regulator domains) + interview-keyword boost.
+Dedup:  Two-layer (title-key + 6-word fingerprint) + AI editorial review
+        (Claude Haiku removes semantic duplicates & recycled stale articles).
 Extras: deterministic "Interview angle" notes; optional Claude "Editor's Brief"
         if ANTHROPIC_API_KEY is set.
 Delivery: Gmail SMTP (SSL).  Triggered by GitHub Actions.
@@ -565,6 +567,92 @@ def build_sections():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# AI Editorial Review  — dedup + freshness pass before email composition
+# ──────────────────────────────────────────────────────────────────────────
+
+def editorial_review(sections, api_key):
+    """Remove semantic duplicates and stale recycled articles using Claude Haiku.
+
+    Title-fingerprint dedup catches exact/near-exact matches. This pass catches
+    the harder cases: same story covered from different angles across sections,
+    and articles that were freshly re-published but carry no new information.
+
+    Skipped silently if ANTHROPIC_API_KEY is not set.
+    Returns the cleaned sections list (may have fewer articles per section).
+    """
+    if not api_key:
+        return sections
+
+    # Build a flat enumerated list so Claude can reference articles by index.
+    flat = []
+    for sec_idx, (meta, arts) in enumerate(sections):
+        for art_idx, art in enumerate(arts):
+            pub_str = (art["published"].strftime("%Y-%m-%d")
+                       if art["published"] else "unknown date")
+            flat.append({
+                "i": len(flat), "si": sec_idx, "ai": art_idx,
+                "section": meta["title"].replace("Top 5 · ", ""),
+                "title": art["title"],
+                "source": art.get("source", ""),
+                "pub": pub_str,
+            })
+
+    if not flat:
+        return sections
+
+    lines = [
+        f"[{f['i']}] [{f['section']}] {f['title']} — {f['source']} ({f['pub']})"
+        for f in flat
+    ]
+    prompt = (
+        "You are the editorial AI for a morning news digest on AI risk, governance, "
+        "and banking. Review the articles below and return ONLY a JSON array of integer "
+        "indices to REMOVE for any of these reasons:\n"
+        "  (a) Same underlying story covered by another article — keep the freshest / "
+        "most authoritative version, remove the rest.\n"
+        "  (b) Stale or recycled article: old news re-surfaced with no new information.\n"
+        "  (c) Clear off-topic filler with zero connection to AI, finance, banking, "
+        "governance, risk management, or general world/India news.\n\n"
+        "Be conservative — only flag obvious cases. If nothing qualifies, return [].\n"
+        "Return ONLY the JSON array, no explanation, no prose.\n\n"
+        + "\n".join(lines)
+    )
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        m = re.search(r"\[[\d\s,]*\]", raw)
+        if not m:
+            print("  [Editor] No removals flagged (empty response).")
+            return sections
+        to_remove = set(json.loads(m.group()))
+        if not to_remove:
+            print("  [Editor] No duplicates or stale articles found.")
+            return sections
+
+        # Build (sec_idx, art_idx) pairs to drop.
+        drop_pairs = {(flat[i]["si"], flat[i]["ai"]) for i in to_remove if i < len(flat)}
+        removed_titles = [flat[i]["title"][:70] for i in sorted(to_remove) if i < len(flat)]
+        print(f"  [Editor] Removed {len(drop_pairs)} articles: {removed_titles}")
+
+        new_sections = []
+        for sec_idx, (meta, arts) in enumerate(sections):
+            kept = [a for ai, a in enumerate(arts) if (sec_idx, ai) not in drop_pairs]
+            new_sections.append((meta, kept))
+        return new_sections
+
+    except Exception as exc:
+        print(f"  [WARN] Editorial review skipped: {type(exc).__name__}: {str(exc)[:80]}")
+        return sections
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Optional AI Editor's Brief
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -773,7 +861,16 @@ def main():
     total = sum(len(a) for _, a in sections)
     for meta, arts in sections:
         print(f"  {meta['title']}: {len(arts)} items")
-    print(f"  Total articles: {total}")
+    print(f"  Total articles collected: {total}")
+
+    # AI editorial review — catches semantic duplicates and recycled stale articles
+    # that title-fingerprint dedup can't detect. Uses Claude Haiku (fast + cheap).
+    # Skipped silently when ANTHROPIC_API_KEY is not set.
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    sections = editorial_review(sections, anthropic_key)
+    after = sum(len(a) for _, a in sections)
+    if after < total:
+        print(f"  Total after editorial review: {after} ({total - after} removed)")
 
     brief = ai_editor_brief(sections)
     if brief:
